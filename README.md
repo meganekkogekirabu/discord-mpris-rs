@@ -1,7 +1,5 @@
 # discord-mpris-rs
 
-Stupid name.
-
 Discord Rich Presence integration for MPRIS2-compatible media players, such as VLC or Lollypop, written in Rust.
 
 This is intended to be an alternative to other similar programs in that it's more meaningfully customisable, letting you change the application used from the built-in one to your own, ignore certain media players, change what's actually displayed in the Rich Presence widget, etc.
