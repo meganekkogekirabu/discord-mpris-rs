@@ -13,10 +13,13 @@ install: build
 	chmod +x ~/.local/bin/discord-mpris-rs
 	cp .env ~/.config/discord-mpris-rs/.env
 	cp systemd/discord-mpris-rs.service ~/.config/systemd/user/discord-mpris-rs.service
-	systemctl --user enable --now discord-mpris-rs.service
+	systemctl --user enable discord-mpris-rs.service
+	systemctl --user start discord-mpris-rs.service
 	cargo clean
 
 uninstall:
-	rm -f ~/.local/bin/discord-mpris-rs ~/.config/systemd/user/discord-mpris-rs.service
-	systemctl stop --user discord-mpris-rs
+	rm -f ~/.local/bin/discord-mpris-rs
+	rm -rf ~/.config/discord-mpris-rs
 	systemctl disable --user discord-mpris-rs
+	systemctl --user daemon-reload
+	rm -f ~/.config/systemd/user/discord-mpris-rs.service
