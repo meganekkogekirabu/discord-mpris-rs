@@ -2,6 +2,10 @@
 name = "discord-mpris-rs"
 version = "0.1.1"
 edition = "2024"
+description = "Discord Rich Presence for MPRIS media players"
+license = "0BSD"
+readme = "README.md"
+repository = "https://github.com/meganekkogekirabu/discord-mpris-rs"
 
 [dependencies]
 discordipc = "0.1.1"
