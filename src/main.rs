@@ -33,6 +33,7 @@ fn process_metadata() -> Result<ActivityInfo, String> {
         .collect();
 
     let show_paused = env::var("show_paused").map_err(|e| e.to_string())?;
+    let show_stopped = env::var("show_stopped").map_err(|e| e.to_string())?;
 
     let mut players = PlayerFinder::new()
         .expect("could not connect to D-Bus")
@@ -44,6 +45,17 @@ fn process_metadata() -> Result<ActivityInfo, String> {
     let player = &players[0]; // just get the first one, since with .find_active(), players can't be ignored
 
     let playback_status = player.get_playback_status().map_err(|e| e.to_string())?;
+    
+    let mut player_name = player.identity().to_string().to_lowercase();
+
+    if show_stopped == "true" && playback_status == PlaybackStatus::Stopped {
+        return Ok(ActivityInfo {
+            details: String::from("Stopped playback"),
+            state: String::new(),
+            subtitle: String::new(),
+            player: player_name,
+        })
+    }
 
     if (playback_status == PlaybackStatus::Paused && show_paused == "false") || playback_status == PlaybackStatus::Stopped {
         return Err("no song is currently playing".to_string());
@@ -87,14 +99,12 @@ fn process_metadata() -> Result<ActivityInfo, String> {
     while ret.len() < 3 {
         ret.push(String::new());
     }
-    
-    let mut player = player.identity().to_string().to_lowercase();
 
     if playback_status == PlaybackStatus::Paused && show_paused == "true" {
-        player.push_str("_paused");
+        player_name.push_str("_paused");
     }
 
-    ret.push(player);
+    ret.push(player_name);
 
     Ok(ActivityInfo {
         details: ret[0].clone(),
