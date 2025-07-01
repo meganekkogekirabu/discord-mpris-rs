@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let activity_packet = Packet::new_activity(Some(&activity), None);
 
                 if let Err(why) = client.send_and_wait(activity_packet)?.filter() {
-                    panic!("couldn't set activity: {why}");
+                    eprintln!("couldn't set activity: {why}");
                 }
             },
             Err(_) => {
