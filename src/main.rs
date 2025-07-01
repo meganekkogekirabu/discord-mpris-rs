@@ -69,7 +69,7 @@ fn process_metadata() -> Result<ActivityInfo, String> {
         .map(|l| l.to_string())
         .collect();
     
-    // Technically, discordipc only lets you change the "details" and "state" but
+    // Technically, discordipc only lets you change the "details" and "state"
     // but you can add a third row by changing the image alt text, so allow three.
     if rows.len() > 3 {
         rows.truncate(3); // only use the first three
