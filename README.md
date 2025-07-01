@@ -17,6 +17,6 @@ cd discord-mpris-rs
 make
 ```
 
-It can be configured through ~/.config/discord-mpris-rs/.env. Configuration changes require you to restart the service.
+It can be configured through /usr/share/discord-mpris-rs/.env. Configuration changes require you to restart the service.
 
 To uninstall, run `make uninstall`.
