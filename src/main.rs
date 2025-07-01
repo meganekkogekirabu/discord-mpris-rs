@@ -112,7 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("update_interval must be a valid integer")
     );
 
-    let client = Client::new_simple("1389363158874980473");
+    let application = env::var("application_id").map_err(|e| e.to_string())?;
+
+    let client = Client::new_simple(application);
     client.connect_and_wait()?.filter()?;
 
     loop {
