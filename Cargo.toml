@@ -1,0 +1,10 @@
+[package]
+name = "discord-mpris-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+discordipc = "0.1.1"
+dotenv = "0.15.0"
+mpris = "2.0.1"
+regex = "1.11.1"
