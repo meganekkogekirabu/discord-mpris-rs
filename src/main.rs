@@ -4,7 +4,7 @@ use mpris::{MetadataValue, PlayerFinder, PlaybackStatus};
 use musicbrainz_rs::entity::release::{Release, ReleaseSearchQuery};
 use musicbrainz_rs::prelude::*;
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, escape};
 use std::env;
 use std::error::Error;
 use std::sync::{Mutex, MutexGuard, Arc};
@@ -13,9 +13,9 @@ use tokio::time::sleep;
 
 async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
     let query = ReleaseSearchQuery::query_builder()
-        .release(&current.release)
+        .release(&escape(&current.release))
         .and()
-        .artist(&current.artist)
+        .artist(&escape(&current.artist))
         .build();
 
     let results = Release::search(query)
