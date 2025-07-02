@@ -5,9 +5,11 @@ use musicbrainz_rs::entity::release::{Release, ReleaseSearchQuery};
 use musicbrainz_rs::prelude::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::{env, sync::{Mutex, MutexGuard}, thread};
+use std::env;
 use std::error::Error;
+use std::sync::{Mutex, MutexGuard, Arc};
 use std::time::Duration;
+use tokio::time::sleep;
 
 async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
     let query = ReleaseSearchQuery::query_builder()
@@ -34,11 +36,29 @@ async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct ActivityInfo {
-    details: String,  // 1st row
-    state: String,    // 2nd row
-    subtitle: String, // 3rd row
-    image: String,    // Cover Art Archive URL or media player name
+    details: Arc<str>,  // 1st row
+    state: Arc<str>,    // 2nd row
+    subtitle: Arc<str>, // 3rd row
+    image: Arc<str>,    // Cover Art Archive URL or media player name
+}
+
+impl ActivityInfo {
+    fn new_empty() -> ActivityInfo {
+        return ActivityInfo {
+            details: "".into(),
+            state: "".into(),
+            subtitle: "".into(),
+            image: "".into(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.details.is_empty()
+            && self.state.is_empty()
+            && self.subtitle.is_empty()
+            && self.image.is_empty()
+    }
 }
 
 fn value_to_string(val: &MetadataValue) -> String {
@@ -54,18 +74,31 @@ fn value_to_string(val: &MetadataValue) -> String {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone)]
 struct Current {
     release: String,
     artist: String,
     url: String,
+    activity: ActivityInfo,
 }
+
+impl PartialEq for Current {
+    // Ignore activity in comparisons.
+    fn eq(&self, other: &Self) -> bool {
+        self.release == other.release
+            && self.artist == other.artist
+            && self.url == other.url
+    }
+}
+
+impl Eq for Current {}
 
 static CURRENT: Lazy<Mutex<Current>> = Lazy::new(|| {
     Mutex::new(Current {
         release: String::new(),
         artist: String::new(),
         url: String::new(),
+        activity: ActivityInfo::new_empty(),
     })
 });
 
@@ -77,6 +110,10 @@ fn set_current(new: Current) {
 fn read_current() -> MutexGuard<'static, Current> {
     CURRENT.lock().unwrap()
 }
+
+static FILTER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new("^.*?\\{([^}]+)\\}.*?$").unwrap()
+});
 
 async fn process_metadata() -> Result<ActivityInfo, String> {
     let ignore: Vec<String> = env::var("ignored_players")
@@ -107,10 +144,10 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
 
     if show_stopped == "true" && playback_status == PlaybackStatus::Stopped {
         return Ok(ActivityInfo {
-            details: String::from("Stopped playback"),
-            state: String::new(),
-            subtitle: String::new(),
-            image: player_name,
+            details: "Stopped playback".into(),
+            state: "".into(),
+            subtitle: "".into(),
+            image: player_name.into(),
         })
     }
 
@@ -120,36 +157,34 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
     
     let metadata = player.get_metadata().expect("could not get metadata");
 
-    let mut rows: Vec<String> = env::var("rows")
-        .map_err(|e| e.to_string())?
-        .split(",")
-        .map(|l| l.to_string())
-        .collect();
-    
-    // Technically, discordipc only lets you change the "details" and "state"
-    // but you can add a third row by changing the image alt text, so allow three.
-    if rows.len() > 3 {
-        rows.truncate(3); // only use the first three
+    let current = read_current();
+
+    let mut new = Current {
+        release: metadata.album_name().unwrap().to_string(),
+        artist: metadata.album_artists().unwrap().join(", "),
+        url: current.url.clone(),
+        activity: ActivityInfo::new_empty(),
+    };
+
+    if new.release == current.release && !current.activity.is_empty() {
+        return Ok(current.activity.clone());
     }
-    
-    let filter = Regex::new("^.*?\\{([^}]+)\\}.*?$").unwrap(); // fields in config.toml are wrapped in {}
-    let fields: Vec<String> = rows.clone()
-        .into_iter()
-        .map(|l| filter.replace_all(&l, "$1").to_string())
-        .collect();
 
-    let mut ret: Vec<String> = Vec::new();
-    let mut i: usize = 0;
-    
-    for field in fields {
-        let mut name: String = "xesam:".to_owned();
-        name.push_str(&field);
+    drop(current);
 
-        if let Some(val) = metadata.get(&name) {
-            ret.push(rows[i].replace(&format!("{{{field}}}"), &value_to_string(val)));
-            i += 1;
+    let rows: String = env::var("rows")
+        .map_err(|e| e.to_string())?;
+
+    let mut ret = Vec::with_capacity(4);
+    
+    for raw_row in rows.split(",").take(3) {
+        let field = FILTER.replace_all(raw_row, "$1").to_string();
+        let key = format!("xesam:{field}");
+
+        if let Some(val) = metadata.get(&key) {
+            ret.push(raw_row.replace(&format!("{{{field}}}"), &value_to_string(val)));
         } else {
-            return Err(format!("could not get value for {field}, is it a valid xesam field?"));
+            return Err(format!("could not get value for {field}"));
         }
     }
 
@@ -161,37 +196,32 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
         player_name.push_str("_paused");
     }
 
-    let current = read_current().clone();
-
-    let mut new = Current {
-        release: metadata.album_name().unwrap().to_string(),
-        artist: metadata.album_artists().unwrap().join(", "),
-        url: current.url.clone(),
-    };
-
     let fetch_cover_art = env::var("fetch_cover_art").map_err(|e| e.to_string())?;
-    
-    if current != new {
-        if fetch_cover_art == "true" {
-            if let Ok(url) = get_cover_art(new.clone()).await {
-                new.url = url;
-            } else {
-                new.url = player_name;
-            }
+
+    if fetch_cover_art == "true" {
+        if let Ok(url) = get_cover_art(new.clone()).await {
+            new.url = url;
         } else {
             new.url = player_name;
         }
-        set_current(new.clone());
+    } else {
+        new.url = player_name;
     }
     
-    ret.push(new.url);
+    ret.push(new.url.clone());
 
-    Ok(ActivityInfo {
-        details: ret[0].clone(),
-        state: ret[1].clone(),
-        subtitle: ret[2].clone(),
-        image: ret[3].clone(),
-    })
+    assert_eq!(ret.len(), 4);
+
+    new.activity = ActivityInfo {
+        details: Arc::from(ret[0].as_str()),
+        state: Arc::from(ret[1].as_str()),
+        subtitle: Arc::from(ret[2].as_str()),
+        image: Arc::from(ret[3].as_str()),
+    };
+
+    set_current(new.clone());
+
+    Ok(new.activity)
 }
 
 #[tokio::main]
@@ -213,10 +243,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(rows) => {
                 let activity = Activity::new()
                     .kind(ActivityType::Listening)
-                    .details(rows.details.clone())
-                    .state(rows.state.clone())
+                    .details(&*rows.details)
+                    .state(&*rows.state)
                     .assets(Assets::new()
-                        .large_image(&rows.image, Some(&rows.subtitle)));
+                        .large_image(&*rows.image, Some(&*rows.subtitle)));
 
                 let activity_packet = Packet::new_activity(Some(&activity), None);
 
@@ -229,6 +259,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        thread::sleep(interval);
+        sleep(interval).await;
     }
 }
