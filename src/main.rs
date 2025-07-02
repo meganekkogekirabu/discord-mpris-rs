@@ -45,14 +45,6 @@ struct ActivityInfo {
 }
 
 impl ActivityInfo {
-    fn new_empty() -> ActivityInfo {
-        return ActivityInfo {
-            details: "".into(),
-            state: "".into(),
-            subtitle: "".into(),
-            image: "".into(),
-        }
-    }
     fn is_empty(&self) -> bool {
         self.details.is_empty()
             && self.state.is_empty()
@@ -93,13 +85,36 @@ impl PartialEq for Current {
 
 impl Eq for Current {}
 
+impl Current {
+    fn new(activity: Option<ActivityInfo>) -> Self {
+        Current {
+            release: String::new(),
+            artist: String::new(),
+            url: String::new(),
+            activity: activity.unwrap_or_else(ActivityInfo::default),
+        }
+    }
+}
+
+impl Default for Current {
+    fn default() -> Self {
+        Current::new(None)
+    }
+}
+
+impl Default for ActivityInfo {
+    fn default() -> Self {
+        ActivityInfo {
+            details: "".into(),
+            state: "".into(),
+            subtitle: "".into(),
+            image: "".into(),
+        }
+    }
+}
+
 static CURRENT: Lazy<Mutex<Current>> = Lazy::new(|| {
-    Mutex::new(Current {
-        release: String::new(),
-        artist: String::new(),
-        url: String::new(),
-        activity: ActivityInfo::new_empty(),
-    })
+    Mutex::new(Current::default())
 });
 
 fn set_current(new: Current) {
@@ -111,11 +126,16 @@ fn read_current() -> MutexGuard<'static, Current> {
     CURRENT.lock().unwrap()
 }
 
+fn reset_current() {
+    let mut current = CURRENT.lock().unwrap();
+    *current = Current::default();
+}
+
 static FILTER: Lazy<Regex> = Lazy::new(|| {
     Regex::new("^.*?\\{([^}]+)\\}.*?$").unwrap()
 });
 
-async fn process_metadata() -> Result<ActivityInfo, String> {
+async fn process_metadata() -> Result<Current, String> {
     let ignore: Vec<String> = env::var("ignored_players")
         .map_err(|e| e.to_string())?
         .split(",")
@@ -143,12 +163,12 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
     let mut player_name = player.identity().to_string().to_lowercase();
 
     if show_stopped == "true" && playback_status == PlaybackStatus::Stopped {
-        return Ok(ActivityInfo {
+        return Ok(Current::new(Some(ActivityInfo {
             details: "Stopped playback".into(),
             state: "".into(),
             subtitle: "".into(),
             image: player_name.into(),
-        })
+        })));
     }
 
     if (playback_status == PlaybackStatus::Paused && show_paused == "false") || playback_status == PlaybackStatus::Stopped {
@@ -163,11 +183,11 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
         release: metadata.album_name().unwrap().to_string(),
         artist: metadata.album_artists().unwrap().join(", "),
         url: current.url.clone(),
-        activity: ActivityInfo::new_empty(),
+        activity: ActivityInfo::default(),
     };
 
     if new.release == current.release && !current.activity.is_empty() {
-        return Ok(current.activity.clone());
+        return Ok(current.clone());
     }
 
     drop(current);
@@ -219,9 +239,7 @@ async fn process_metadata() -> Result<ActivityInfo, String> {
         image: Arc::from(ret[3].as_str()),
     };
 
-    set_current(new.clone());
-
-    Ok(new.activity)
+    Ok(new)
 }
 
 #[tokio::main]
@@ -237,25 +255,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let client = Client::new_simple(application);
     client.connect_and_wait()?.filter()?;
+    
+    let mut listening = false;
 
     loop {
         match process_metadata().await {
-            Ok(rows) => {
-                let activity = Activity::new()
-                    .kind(ActivityType::Listening)
-                    .details(&*rows.details)
-                    .state(&*rows.state)
-                    .assets(Assets::new()
-                        .large_image(&*rows.image, Some(&*rows.subtitle)));
+            Ok(new) => {
+                listening = true;
+                let rows = &new.activity;
 
-                let activity_packet = Packet::new_activity(Some(&activity), None);
+                if *read_current() != new {
+                    set_current(new.clone());
 
-                if let Err(why) = client.send_and_wait(activity_packet)?.filter() {
-                    eprintln!("couldn't set activity: {why}");
+                    let activity = Activity::new()
+                        .kind(ActivityType::Listening)
+                        .details(&*rows.details)
+                        .state(&*rows.state)
+                        .assets(Assets::new()
+                            .large_image(&*rows.image, Some(&*rows.subtitle)));
+
+                    let activity_packet = Packet::new_activity(Some(&activity), None);
+
+                    if let Err(why) = client.send_and_wait(activity_packet)?.filter() {
+                        eprintln!("couldn't set activity: {why}");
+                    }
                 }
             },
             Err(_) => {
-                let _ = client.send_and_wait(Packet::new_activity(None, None))?.filter(); // send a blank packet to clear the rich presence
+                if listening != false {
+                    listening = false;
+                    reset_current();
+                    let _ = client.send_and_wait(Packet::new_activity(None, None))?.filter(); // send a blank packet to clear the rich presence
+                }
             }
         }
 
