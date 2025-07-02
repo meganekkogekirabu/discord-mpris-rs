@@ -1,15 +1,44 @@
 use discordipc::{activity::{Activity, ActivityType, Assets}, Client, packet::Packet};
 use dotenv::dotenv;
 use mpris::{MetadataValue, PlayerFinder, PlaybackStatus};
-use regex::Regex;   
-use std::{env, thread};
+use musicbrainz_rs::entity::release::{Release, ReleaseSearchQuery};
+use musicbrainz_rs::prelude::*;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use std::{env, sync::{Mutex, MutexGuard}, thread};
+use std::error::Error;
 use std::time::Duration;
+
+async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
+    let query = ReleaseSearchQuery::query_builder()
+        .release(&current.release)
+        .and()
+        .artist(&current.artist)
+        .build();
+
+    let results = Release::search(query)
+        .execute()
+        .await?;
+
+    if let Some(release) = results.entities.first() {
+        let mbid = &release.id;
+
+        if mbid == "1735e086-462e-42c3-b615-eebbd5e9f352" { // Nagios check release. This is what gets returned for "", "".
+            return Err("could not find cover art".into());
+        }
+
+        let url = format!("https://coverartarchive.org/release/{mbid}/front");
+        return Ok(url);
+    } else {
+        return Err(format!("could not find release {}", current.release).into());
+    }
+}
 
 struct ActivityInfo {
     details: String,  // 1st row
     state: String,    // 2nd row
     subtitle: String, // 3rd row
-    player: String,   // name used to find the icon
+    image: String,    // Cover Art Archive URL or media player name
 }
 
 fn value_to_string(val: &MetadataValue) -> String {
@@ -25,7 +54,31 @@ fn value_to_string(val: &MetadataValue) -> String {
     }
 }
 
-fn process_metadata() -> Result<ActivityInfo, String> {
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct Current {
+    release: String,
+    artist: String,
+    url: String,
+}
+
+static CURRENT: Lazy<Mutex<Current>> = Lazy::new(|| {
+    Mutex::new(Current {
+        release: String::new(),
+        artist: String::new(),
+        url: String::new(),
+    })
+});
+
+fn set_current(new: Current) {
+    let mut current = CURRENT.lock().unwrap();
+    *current = new;
+}
+
+fn read_current() -> MutexGuard<'static, Current> {
+    CURRENT.lock().unwrap()
+}
+
+async fn process_metadata() -> Result<ActivityInfo, String> {
     let ignore: Vec<String> = env::var("ignored_players")
         .map_err(|e| e.to_string())?
         .split(",")
@@ -57,7 +110,7 @@ fn process_metadata() -> Result<ActivityInfo, String> {
             details: String::from("Stopped playback"),
             state: String::new(),
             subtitle: String::new(),
-            player: player_name,
+            image: player_name,
         })
     }
 
@@ -108,17 +161,41 @@ fn process_metadata() -> Result<ActivityInfo, String> {
         player_name.push_str("_paused");
     }
 
-    ret.push(player_name);
+    let current = read_current().clone();
+
+    let mut new = Current {
+        release: metadata.album_name().unwrap().to_string(),
+        artist: metadata.album_artists().unwrap().join(", "),
+        url: current.url.clone(),
+    };
+
+    let fetch_cover_art = env::var("fetch_cover_art").map_err(|e| e.to_string())?;
+    
+    if current != new {
+        if fetch_cover_art == "true" {
+            if let Ok(url) = get_cover_art(new.clone()).await {
+                new.url = url;
+            } else {
+                new.url = player_name;
+            }
+        } else {
+            new.url = player_name;
+        }
+        set_current(new.clone());
+    }
+    
+    ret.push(new.url);
 
     Ok(ActivityInfo {
         details: ret[0].clone(),
         state: ret[1].clone(),
         subtitle: ret[2].clone(),
-        player: ret[3].clone(),
+        image: ret[3].clone(),
     })
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
     let interval = Duration::from_millis(
@@ -132,14 +209,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.connect_and_wait()?.filter()?;
 
     loop {
-        match process_metadata() {
+        match process_metadata().await {
             Ok(rows) => {
                 let activity = Activity::new()
                     .kind(ActivityType::Listening)
                     .details(rows.details.clone())
                     .state(rows.state.clone())
                     .assets(Assets::new()
-                        .large_image(&rows.player, Some(&rows.subtitle)));
+                        .large_image(&rows.image, Some(&rows.subtitle)));
 
                 let activity_packet = Packet::new_activity(Some(&activity), None);
 
