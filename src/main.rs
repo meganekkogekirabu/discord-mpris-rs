@@ -42,6 +42,10 @@ fn process_metadata() -> Result<ActivityInfo, String> {
 
     players.retain(|p| !ignore.contains(&p.identity().to_string()));
 
+    if players.len() == 0 {
+        return Err("no players are active".to_string());
+    }
+
     let player = &players[0]; // just get the first one, since with .find_active(), players can't be ignored
 
     let playback_status = player.get_playback_status().map_err(|e| e.to_string())?;
