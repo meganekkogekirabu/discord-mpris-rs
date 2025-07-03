@@ -1,17 +1,214 @@
 use discordipc::{activity::{Activity, ActivityType, Assets}, Client, packet::Packet};
 use dotenv::dotenv;
-use mpris::{MetadataValue, PlayerFinder, PlaybackStatus};
+use mpris::{MetadataValue, PlaybackStatus, PlayerFinder};
 use musicbrainz_rs::entity::release::{Release, ReleaseSearchQuery};
 use musicbrainz_rs::prelude::*;
 use once_cell::sync::Lazy;
 use regex::{Regex, escape};
+use std::collections::HashMap;
 use std::env;
+use std::num::ParseIntError;
 use std::error::Error;
-use std::sync::{Mutex, MutexGuard, Arc};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("Environment variable error: {0}")]
+    EnvVar(#[from] env::VarError),
+
+    #[error("DBus error: {0}")]
+    DBus(#[from] mpris::DBusError),
+
+    #[error("Finding error: {0}")]
+    Finding(#[from] mpris::FindingError),
+
+    #[error("MusicBrainz error: {0}")]
+    MusicBrainz(#[from] musicbrainz_rs::Error),
+
+    #[error("No active players")]
+    NoActivePlayers,
+
+    #[error("Failed to parse integer: {0}")]
+    ParseInt(#[from] ParseIntError),
+
+    #[error("Type mismatch for key {0}")]
+    TypeMismatch(String),
+
+    #[error("Error: {0}")]
+    ParseError(#[from] Box<dyn Error>),
+
+    #[error("No song is playing")]
+    NoSongPlaying,
+
+    #[error("Field not found: {0}")]
+    FieldNotFound(String),
+}
+
+#[derive(Debug, Default)]
+struct Config {
+    cache: RwLock<HashMap<String, ConfigValue>>,
+}
+
+#[derive(Debug, Clone)]
+enum ConfigValue {
+    Vec(Vec<String>),
+    String(String),
+    Bool(bool),
+    Duration(Duration),
+}
+
+static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| {
+    Mutex::new(Config::new())
+});
+
+impl Config {
+    pub fn new() -> Self {
+        Config {
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn get<T: TryFrom<ConfigValue>>(&self, key: &str) -> Result<T, AppError> {
+        // check cache first
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(val) = cache.get(key) {
+                return T::try_from(val.clone())
+                    .map_err(|_| AppError::TypeMismatch(key.to_string()));
+            }
+        }
+
+        let env_value = env::var(key)?;
+        let parsed_value = Self::parse_value(key, &env_value)?;
+
+        // cache parsed value
+        {
+            let mut cache = self.cache.write().unwrap();
+            cache.insert(key.to_string(), parsed_value.clone());
+        }
+
+        T::try_from(parsed_value).map_err(|_| AppError::TypeMismatch(key.to_string()))
+    }
+
+    fn parse_value(key: &str, raw: &str) -> Result<ConfigValue, Box<dyn Error>> {
+        if let Ok(b) = raw.parse::<bool>() {
+            Ok(ConfigValue::Bool(b))
+
+        } else if key == "ignored_players" || key == "rows" {
+            let vec = raw.split(',').map(|s| s.trim().to_string()).collect();
+            Ok(ConfigValue::Vec(vec))
+
+        } else if key == "update_interval" {
+            let duration = Duration::from_millis(raw.parse::<u64>()?);
+            Ok(ConfigValue::Duration(duration))
+            
+        } else {
+            Ok(ConfigValue::String(raw.to_string()))
+        }
+    }
+}
+
+fn read_config() -> MutexGuard<'static, Config> {
+    CONFIG.lock().unwrap()
+}
+
+impl TryFrom<ConfigValue> for bool {
+    type Error = ();
+
+    fn try_from(value: ConfigValue) -> Result<Self, Self::Error> {
+        match value {
+            ConfigValue::Bool(b) => Ok(b),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<ConfigValue> for String {
+    type Error = ();
+
+    fn try_from(value: ConfigValue) -> Result<Self, Self::Error> {
+        match value {
+            ConfigValue::String(s) => Ok(s),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<ConfigValue> for Vec<String> {
+    type Error = ();
+
+    fn try_from(value: ConfigValue) -> Result<Self, Self::Error> {
+        match value {
+            ConfigValue::Vec(s) => Ok(s),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<ConfigValue> for Duration {
+    type Error = ();
+
+    fn try_from(value: ConfigValue) -> Result<Self, Self::Error> {
+        match value {
+            ConfigValue::Duration(s) => Ok(s),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CoverArt {
+    cache: RwLock<HashMap<String, String>>,
+}
+
+impl CoverArt {
+    pub fn cache(&self, release: String, artist: String, url: String) {
+        {
+            let mut cache = self.cache.write().unwrap();
+            cache.insert(format!("{release}_{artist}"), url);
+        }
+    }
+
+    pub fn has(&self, key: &str) -> bool {
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(_) = cache.get(key) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    pub fn get(&self, key: String) -> String {
+        {
+            let cache = self.cache.read().unwrap();
+            
+            if let Some(v) = cache.get(&key) {
+                return v.to_string();
+            } else {
+                return String::new();
+            }
+        }
+    }
+}
+
+static COVER_ART_CACHE: Lazy<Mutex<CoverArt>> = Lazy::new(|| {
+    Mutex::new(CoverArt {
+        cache: RwLock::new(HashMap::new()),
+    })
+});
+
 async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
+    let cover_art = COVER_ART_CACHE.lock().unwrap();
+    let key = format!("{}_{}", current.release, current.artist);
+
+    if cover_art.has(&key) {
+        return Ok(cover_art.get(key));
+    }
+
     let query = ReleaseSearchQuery::query_builder()
         .release(&escape(&current.release))
         .and()
@@ -30,6 +227,10 @@ async fn get_cover_art(current: Current) -> Result<String, Box<dyn Error>> {
         }
 
         let url = format!("https://coverartarchive.org/release/{mbid}/front");
+        cover_art.cache(current.release, current.artist, url.clone());
+        
+        drop(cover_art);
+
         return Ok(url);
     } else {
         return Err(format!("could not find release {}", current.release).into());
@@ -50,6 +251,17 @@ impl ActivityInfo {
             && self.state.is_empty()
             && self.subtitle.is_empty()
             && self.image.is_empty()
+    }
+}
+
+impl Default for ActivityInfo {
+    fn default() -> Self {
+        ActivityInfo {
+            details: "".into(),
+            state: "".into(),
+            subtitle: "".into(),
+            image: "".into(),
+        }
     }
 }
 
@@ -83,8 +295,6 @@ impl PartialEq for Current {
     }
 }
 
-impl Eq for Current {}
-
 impl Current {
     fn new(activity: Option<ActivityInfo>) -> Self {
         Current {
@@ -102,17 +312,6 @@ impl Default for Current {
     }
 }
 
-impl Default for ActivityInfo {
-    fn default() -> Self {
-        ActivityInfo {
-            details: "".into(),
-            state: "".into(),
-            subtitle: "".into(),
-            image: "".into(),
-        }
-    }
-}
-
 static CURRENT: Lazy<Mutex<Current>> = Lazy::new(|| {
     Mutex::new(Current::default())
 });
@@ -120,10 +319,6 @@ static CURRENT: Lazy<Mutex<Current>> = Lazy::new(|| {
 fn set_current(new: Current) {
     let mut current = CURRENT.lock().unwrap();
     *current = new;
-}
-
-fn read_current() -> MutexGuard<'static, Current> {
-    CURRENT.lock().unwrap()
 }
 
 fn reset_current() {
@@ -135,34 +330,29 @@ static FILTER: Lazy<Regex> = Lazy::new(|| {
     Regex::new("^.*?\\{([^}]+)\\}.*?$").unwrap()
 });
 
-async fn process_metadata() -> Result<Current, String> {
-    let ignore: Vec<String> = env::var("ignored_players")
-        .map_err(|e| e.to_string())?
-        .split(",")
-        .map(|l| l.to_string())
-        .collect();
+async fn process_metadata() -> Result<Current, AppError> {
+    let config = CONFIG.lock().unwrap();
+    let ignored_players: Vec<String> = config.get("ignored_players")?;
 
-    let show_paused = env::var("show_paused").map_err(|e| e.to_string())?;
-    let show_stopped = env::var("show_stopped").map_err(|e| e.to_string())?;
+    let show_paused: bool = config.get("show_paused")?;
+    let show_stopped: bool = config.get("show_stopped")?;
 
-    let mut players = PlayerFinder::new()
-        .expect("could not connect to D-Bus")
-        .find_all()
-        .map_err(|e| e.to_string())?;
+    let mut players = PlayerFinder::new()?
+        .find_all()?;
 
-    players.retain(|p| !ignore.contains(&p.identity().to_string()));
+    players.retain(|p| !ignored_players.contains(&p.identity().to_string()));
 
     if players.len() == 0 {
-        return Err("no players are active".to_string());
+        return Err(AppError::NoActivePlayers);
     }
 
     let player = &players[0]; // just get the first one, since with .find_active(), players can't be ignored
 
-    let playback_status = player.get_playback_status().map_err(|e| e.to_string())?;
+    let playback_status = player.get_playback_status()?;
     
     let mut player_name = player.identity().to_string().to_lowercase();
 
-    if show_stopped == "true" && playback_status == PlaybackStatus::Stopped {
+    if show_stopped && playback_status == PlaybackStatus::Stopped {
         return Ok(Current::new(Some(ActivityInfo {
             details: "Stopped playback".into(),
             state: "".into(),
@@ -171,13 +361,13 @@ async fn process_metadata() -> Result<Current, String> {
         })));
     }
 
-    if (playback_status == PlaybackStatus::Paused && show_paused == "false") || playback_status == PlaybackStatus::Stopped {
-        return Err("no song is currently playing".to_string());
+    if (playback_status == PlaybackStatus::Paused && show_paused) || playback_status == PlaybackStatus::Stopped {
+        return Err(AppError::NoSongPlaying);
     }
     
     let metadata = player.get_metadata().expect("could not get metadata");
 
-    let current = read_current();
+    let current = CURRENT.lock().unwrap();
 
     let mut new = Current {
         release: metadata.album_name().unwrap().to_string(),
@@ -192,19 +382,18 @@ async fn process_metadata() -> Result<Current, String> {
 
     drop(current);
 
-    let rows: String = env::var("rows")
-        .map_err(|e| e.to_string())?;
+    let rows: Vec<String> = config.get("rows")?;
 
     let mut ret = Vec::with_capacity(4);
     
-    for raw_row in rows.split(",").take(3) {
-        let field = FILTER.replace_all(raw_row, "$1").to_string();
+    for raw_row in rows.into_iter().take(3) {
+        let field = FILTER.replace_all(&raw_row, "$1").to_string();
         let key = format!("xesam:{field}");
 
         if let Some(val) = metadata.get(&key) {
             ret.push(raw_row.replace(&format!("{{{field}}}"), &value_to_string(val)));
         } else {
-            return Err(format!("could not get value for {field}"));
+            return Err(AppError::FieldNotFound(field));
         }
     }
 
@@ -212,17 +401,22 @@ async fn process_metadata() -> Result<Current, String> {
         ret.push(String::new());
     }
 
-    if playback_status == PlaybackStatus::Paused && show_paused == "true" {
+    if playback_status == PlaybackStatus::Paused && show_paused {
         player_name.push_str("_paused");
     }
 
-    let fetch_cover_art = env::var("fetch_cover_art").map_err(|e| e.to_string())?;
+    let fetch_cover_art: bool = config.get("fetch_cover_art")?;
 
-    if fetch_cover_art == "true" {
-        if let Ok(url) = get_cover_art(new.clone()).await {
-            new.url = url;
-        } else {
-            new.url = player_name;
+    drop(config);
+
+    if fetch_cover_art {
+        match get_cover_art(new.clone()).await {
+            Ok(url) => {
+                new.url = url;
+            },
+            Err(_) => {
+                new.url = player_name; // fall back to the icon for the media player
+            }
         }
     } else {
         new.url = player_name;
@@ -246,12 +440,9 @@ async fn process_metadata() -> Result<Current, String> {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
-    let interval = Duration::from_millis(
-        env::var("update_interval")?.parse()
-            .expect("update_interval must be a valid integer")
-    );
+    let interval = read_config().get("update_interval")?;
 
-    let application = env::var("application_id").map_err(|e| e.to_string())?;
+    let application: String = read_config().get("application_id")?;
 
     let client = Client::new_simple(application);
     client.connect_and_wait()?.filter()?;
@@ -264,7 +455,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 listening = true;
                 let rows = &new.activity;
 
-                if *read_current() != new {
+                if *CURRENT.lock().unwrap() != new {
                     set_current(new.clone());
 
                     let activity = Activity::new()

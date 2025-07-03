@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "discord-mpris-rs"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "discordipc",
  "dotenv",
@@ -270,6 +270,7 @@ dependencies = [
  "musicbrainz_rs",
  "once_cell",
  "regex",
+ "thiserror 2.0.12",
  "tokio",
 ]
 
