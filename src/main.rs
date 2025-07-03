@@ -361,7 +361,7 @@ async fn process_metadata() -> Result<Current, AppError> {
         })));
     }
 
-    if (playback_status == PlaybackStatus::Paused && show_paused) || playback_status == PlaybackStatus::Stopped {
+    if (playback_status == PlaybackStatus::Paused && !show_paused) || playback_status == PlaybackStatus::Stopped {
         return Err(AppError::NoSongPlaying);
     }
     
