@@ -284,6 +284,7 @@ struct Current {
     artist: String,
     url: String,
     activity: ActivityInfo,
+    track: String,
 }
 
 impl PartialEq for Current {
@@ -292,6 +293,7 @@ impl PartialEq for Current {
         self.release == other.release
             && self.artist == other.artist
             && self.url == other.url
+            && self.track == other.track
     }
 }
 
@@ -302,6 +304,7 @@ impl Current {
             artist: String::new(),
             url: String::new(),
             activity: activity.unwrap_or_else(ActivityInfo::default),
+            track: String::new(),
         }
     }
 }
@@ -374,9 +377,10 @@ async fn process_metadata() -> Result<Current, AppError> {
         artist: metadata.album_artists().unwrap().join(", "),
         url: current.url.clone(),
         activity: ActivityInfo::default(),
+        track: metadata.track_id().unwrap().to_string(),
     };
 
-    if new.release == current.release && !current.activity.is_empty() {
+    if new.release == current.release && !current.activity.is_empty() && new.track == current.track {
         return Ok(current.clone());
     }
 
@@ -440,9 +444,12 @@ async fn process_metadata() -> Result<Current, AppError> {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
-    let interval = read_config().get("update_interval")?;
+    let config = read_config();
 
-    let application: String = read_config().get("application_id")?;
+    let interval = config.get("update_interval")?;
+    let application: String = config.get("application_id")?;
+
+    drop(config);
 
     let client = Client::new_simple(application);
     client.connect_and_wait()?.filter()?;
